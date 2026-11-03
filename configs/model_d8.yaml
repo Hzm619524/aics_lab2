@@ -1,0 +1,64 @@
+# 模型配置：d8 中文（Stage A 默认）
+
+# ⚠️⚠️ 本文件是**纯文档，不参与运行**：没有任何代码读它。
+#
+# 真正的训练参数由 runs/npu_stage_a.sh 通过命令行传给 nanochat。
+# 改这里的数字**不会有任何效果** —— 它只是把推导结果集中记下来便于核对。
+
+model:
+  depth: 8                 # nanochat 的单一复杂度旋钮
+  n_embd: 512              # = 64 * depth
+  n_head: 4                # = depth / 2（head_dim 固定 128）
+  n_kv_head: 4             # 与 n_head 相同 => 无 GQA 压缩
+  head_dim: 128
+  n_layer: 8
+  max_seq_len: 2048
+  window_pattern: SSSL     # 3 层短窗(512) + 1 层全长，最后一层强制全长
+
+vocab:
+  size: 16384              # 2^14，中文 BPE
+  # 为什么不用上游默认的 32768：
+  #   1) d8 的 embedding + lm_head 从 33.6M 降到 16.8M
+  #   2) 训练时 logits 是 B*T*V 的 fp32 张量，显存占用减半（8.6GB -> 4.3GB）
+  target_compression: 4.01     # 字节/token（实测；≈1.30 字/token）。
+  # 注意单位：tok_eval 打印的 Ratio 是**字节/token**，不是字/token。
+  # 参考：GPT-2 在同批中文上 1.39，GPT-4 2.22。  # 验收线：>= 1.4 字/token
+
+# 参数量（按 nanochat/gpt.py 推导，见 docs/01_budget.md 第 2 节）
+params:
+  transformer_matrices: 25165824   # 12 * n_embd^2 * depth
+  wte: 8388608                     # vocab_size * n_embd
+  lm_head: 8388608                 # 不共享权重
+  value_embeds_disabled: true      # 关闭 VE：占总参数比例过高
+  total: 41943082                  # ≈ 41.9M
+  scaling_params: 33554432         # transformer_matrices + lm_head（nanochat 的统计口径）
+
+compute:
+  flops_per_token: 245366928       # 6*scaling_params + 注意力项，见 docs/01_budget.md 第 3 节
+  total_batch_size: 524288         # 2^19 token
+  num_iterations: 3520             # 1.85B token / 524288（3.5 epoch，实测压缩率 4.01 字节/token）
+  planned_tokens: 1845460735   # 3.5 epoch × 5.27 亿
+  optim:
+    # DAPT 阶段下调至约 1/5
+    matrix_lr: 0.02
+    embedding_lr: 0.3
+    unembedding_lr: 0.008
+    scalar_lr: 0.5
+    weight_decay: 0.28
+
+# 显存与精度
+precision:
+  compute_dtype: bfloat16   # 必须显式指定，否则 NPU 上静默 fp32
+  fp8: false                # 910B 无 fp8 能力
+  enforce_eager: true       # 昇腾上关闭 torch.compile。
+  # 真实控制点在 nanochat/common.py 的 compile_enabled()（npu 上自动关闭）
+  # 与 scripts/base_train.py 的 --enforce-eager；本行只是记录设计意图。
+
+# 参数量估算的校验锚点
+# 用同一套公式计算 d20 + V=32768，应得到 896,535,720，
+# 与 nanochat-ascend 公布的数字一致 —— 说明推导无误。
+validation_anchor:
+  depth: 20
+  vocab_size: 32768
+  value_embeds_enabled: true
+  expected_total_params: 896535720

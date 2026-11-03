@@ -1,0 +1,16 @@
+# 课程数据包完整性清单（sha256sum 格式）
+#
+# 对应云盘分享链接：https://box.nju.edu.cn/d/2b845e514e754429bb86/
+# 校验方式一（本仓库脚本，会自动读取本文件）：
+#     python scripts/fetch_box_data.py
+# 校验方式二（下载目录里直接跑）：
+#     sha256sum -c packed_data.sha256
+#
+# 记录于 2026-10-04，哈希取自打包机上的归档原件，
+# 并已通过从分享链接**重新下载**比对确认（见提交信息）。
+# 若云盘上的文件被重新上传，哈希会不符——这时请先确认来源，再用
+# `--no-verify` 临时跳过，不要盲目放行。
+da5d54dc89ad63f99e42a89b5bf631a63887086e82bcc8d798e9b605851f54f3  base_data_climbmix.tar
+eac18b4615ef3bc08bf811ad8a43832319b4ddca83e3b318514e56af625ab6ba  data_wuxia_jinyong.tar
+ae8e7613d3e484c98ba76d8ab9be0071ef57a329618f1620107f11939c53f631  data_wuxia_mixed.tar
+acffb88ec93694a42833bd475601d04d988f69d7469317e3d2cba30a141b8b72  wuxia_sft.tar.gz

@@ -1,0 +1,34 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+
+# 本地配置和密钥
+.env
+.env.*
+!.env.example
+
+# 系统文件
+.DS_Store
+Thumbs.db
+
+# 下载的数据包和武侠数据
+data/packed/
+base_data_climbmix/
+data_wuxia_jinyong/
+data_wuxia_mixed/
+wuxia_sft/
+*.zip
+*.tar
+*.tar.gz
+
+# 训练产物
+outputs/
+checkpoints/
+logs/
+wandb/
+*.pt
+*.pth
+*.safetensors

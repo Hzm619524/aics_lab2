@@ -1,0 +1,19 @@
+# 本项目运行时与开发依赖（不需要 NPU、不需要 CANN）
+# ⚠️ 这里【故意不包含】torch / torch-npu。
+# 它们必须与服务器上的 CANN 版本严格匹配，由 NPU 服务器自己的环境提供。
+# 从 PyPI 装一个通用 torch 会破坏 torch-npu 的匹配关系。
+
+# ---- 训练与分词（上游 nanochat 的依赖）----
+rustbpe>=0.1.0     # BPE 训练库，scripts/tok_train.py 必需
+tiktoken>=0.11.0   # 分词器推理，nanochat/tokenizer.py 必需
+psutil>=7.1.0      # nanochat/common.py 用于检测系统资源
+requests>=2.31.0   # nanochat/dataset.py 下载数据分片
+
+# ---- 数据与工具 ----
+pyarrow>=14.0.0    # parquet 读写（训练数据格式 + scripts/make_parquet.py）
+numpy>=1.26.0      # 数据处理；torch 也需要它
+pyyaml>=6.0        # scripts/check_budget.py 读语料清单；base_eval.py 也用到
+filelock>=3.0      # nanochat/common.py 与 tasks/common.py 的并发下载锁
+
+# ---- 测试 ----
+pytest>=8.0.0

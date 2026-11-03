@@ -1,0 +1,23 @@
+[project]
+name = "nanochat-npu-assign"
+version = "0.1.0"
+description = "学生作业版：在昇腾 NPU 上从零训练一个中文 GPT"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+
+dependencies = [
+    "filelock>=3.19.0",
+    "numpy>=1.26.0",
+    "psutil>=7.1.0",
+    "pyarrow>=14.0.0",
+    "requests>=2.31.0",
+    "rustbpe>=0.1.0",
+    "tiktoken>=0.11.0",
+]
+
+[project.optional-dependencies]
+npu = ["torch", "torch-npu"]
+
+[tool.pytest.ini_options]
+testpaths = ["."]
