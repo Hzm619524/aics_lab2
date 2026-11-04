@@ -113,7 +113,31 @@ def _sdpa_attention(q, k, v, window_size, enable_gqa):
     #     （True 表示屏蔽）—— 进阶挑战 1 里这是个坑
     #   * enable_gqa 由调用方算好传进来（本模型 n_kv_head == n_head，实际是 False）
     #   * window 取 window_size[0]；本实现只支持左窗（右窗恒为 0）
-    raise NotImplementedError("核心任务 2：用 SDPA 实现注意力")
+    tq, tk = q.size(-2), k.size(-2)
+    left = window_size[0]
+
+    if left < 0 and tq == tk:
+        return F.scaled_dot_product_attention(
+            q, k, v, is_causal=True, enable_gqa=enable_gqa
+        )
+
+    if tq == 1:
+        if left >= 0:
+            start = max(0, tk - (left + 1))
+            k = k[..., start:, :]
+            v = v[..., start:, :]
+        return F.scaled_dot_product_attention(
+            q, k, v, is_causal=False, enable_gqa=enable_gqa
+        )
+
+    row = (tk - tq) + torch.arange(tq, device=q.device).unsqueeze(1)
+    col = torch.arange(tk, device=q.device).unsqueeze(0)
+    mask = col <= row
+    if left >= 0:
+        mask = mask & ((row - col) <= left)
+    return F.scaled_dot_product_attention(
+        q, k, v, attn_mask=mask, is_causal=False, enable_gqa=enable_gqa
+    )
 # =============================================================================
 # NPU 融合注意力（torch_npu.npu_fusion_attention）
 # =============================================================================
@@ -325,7 +349,44 @@ def flash_attn_func(q, k, v, causal=False, window_size=(-1, -1)):
     #
     # 提示：_should_use_npu_fa 已经写好，它**只对真的有滑窗的层**返回 True ——
     #       实测全长层用融合算子反而慢（0.74×），原因见 docs/02_进阶挑战.md 的挑战 1。
-    raise NotImplementedError("核心任务 3：flash_attn_func 的转置与分发")
+    if USE_FA3:
+        return _fa3.flash_attn_func(
+            q, k, v, causal=causal, window_size=window_size
+        )
+
+    impl = attn_impl()
+    if impl == "npu_fa" and causal and _should_use_npu_fa(window_size, q.size(1)):
+        return _npu_attention(q, k, v, window_size)
+
+    q_bhsd = q.transpose(1, 2)
+    k_bhsd = k.transpose(1, 2)
+    v_bhsd = v.transpose(1, 2)
+    if causal:
+        y = _sdpa_attention(
+            q_bhsd, k_bhsd, v_bhsd, window_size,
+            enable_gqa=q.size(2) != k.size(2),
+        )
+    else:
+        left, right = window_size
+        if left < 0 and right < 0:
+            y = F.scaled_dot_product_attention(
+                q_bhsd, k_bhsd, v_bhsd,
+                enable_gqa=q.size(2) != k.size(2),
+            )
+        else:
+            tq, tk = q.size(1), k.size(1)
+            row = (tk - tq) + torch.arange(tq, device=q.device).unsqueeze(1)
+            col = torch.arange(tk, device=q.device).unsqueeze(0)
+            mask = torch.ones((tq, tk), dtype=torch.bool, device=q.device)
+            if left >= 0:
+                mask &= (row - col) <= left
+            if right >= 0:
+                mask &= (col - row) <= right
+            y = F.scaled_dot_product_attention(
+                q_bhsd, k_bhsd, v_bhsd, attn_mask=mask,
+                enable_gqa=q.size(2) != k.size(2),
+            )
+    return y.transpose(1, 2)
 def flash_attn_with_kvcache(q, k_cache, v_cache, k=None, v=None, cache_seqlens=None,
                             causal=False, window_size=(-1, -1)):
     """
@@ -358,7 +419,34 @@ def flash_attn_with_kvcache(q, k_cache, v_cache, k=None, v=None, cache_seqlens=N
     #
     # 提示：滑窗推理只需最后 window+1 个 key —— 这正是短窗层能省 KV 读取的原因，
     #       也是 docs/02_进阶挑战.md 的挑战 2 里分析推理效率的切入点。
-    raise NotImplementedError("核心任务 4：带 KV cache 的推理注意力")
+    if (k is None) != (v is None):
+        raise ValueError("k and v must either both be provided or both be omitted")
+
+    batch, tq = q.shape[:2]
+    if cache_seqlens is None:
+        cache_seqlens = torch.zeros(batch, dtype=torch.int32, device=q.device)
+    if cache_seqlens.numel() != batch:
+        raise ValueError("cache_seqlens must contain one position per batch row")
+    if not torch.equal(cache_seqlens, cache_seqlens[:1].expand_as(cache_seqlens)):
+        raise ValueError("all batch rows must have the same cache position")
+
+    pos = int(cache_seqlens[0].item())
+    end_pos = pos + (k.size(1) if k is not None else tq)
+    if end_pos > k_cache.size(1):
+        raise ValueError("KV cache capacity exceeded")
+    if k is not None:
+        if k.shape[:2] != (batch, tq) or v.shape[:2] != (batch, tq):
+            raise ValueError("new k/v sequence dimensions must match q")
+        k_cache[:, pos:end_pos].copy_(k)
+        v_cache[:, pos:end_pos].copy_(v)
+
+    k_all = k_cache[:, :end_pos]
+    v_all = v_cache[:, :end_pos]
+    y = _sdpa_attention(
+        q.transpose(1, 2), k_all.transpose(1, 2), v_all.transpose(1, 2),
+        window_size, enable_gqa=q.size(2) != k_all.size(2),
+    )
+    return y.transpose(1, 2)
 # =============================================================================
 # Export: flash_attn module interface (drop-in replacement for FA3)
 # =============================================================================

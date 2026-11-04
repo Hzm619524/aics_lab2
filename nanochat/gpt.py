@@ -98,7 +98,10 @@ def norm(x):
     #   * 输入可能是 bf16；先转 float32 算再转回去更稳
     #
     # 一行就能写完，但请自己实现 —— 进阶挑战 1 要拿它和融合算子对比性能。
-    raise NotImplementedError("基础任务 1：实现 RMSNorm")
+    x_float = x.float()
+    return (x_float * torch.rsqrt(
+        x_float.square().mean(dim=-1, keepdim=True) + _RMS_EPS
+    )).to(dtype=x.dtype)
 class Linear(nn.Linear):
     """nn.Linear that casts weights to match input dtype in forward.
     Replaces autocast: master weights stay fp32 for optimizer precision,
@@ -133,7 +136,11 @@ def apply_rotary_emb(x, cos, sin):
     #   * 频率表由 _precompute_rotary_embeddings 生成（它也留空了）
     #   * 为什么 RoPE 能编码**相对**位置？见 docs/03_思考题.md 第 2 题
     #   * 注意不要就地修改输入（autograd 会不高兴）
-    raise NotImplementedError("基础任务 2：实现 RoPE")
+    x1 = x[..., 0::2]
+    x2 = x[..., 1::2]
+    y1 = x1 * cos - x2 * sin
+    y2 = x1 * sin + x2 * cos
+    return torch.stack((y1, y2), dim=-1).flatten(-2)
 class CausalSelfAttention(nn.Module):
     def __init__(self, config, layer_idx):
         super().__init__()
@@ -203,7 +210,39 @@ class CausalSelfAttention(nn.Module):
         #
         # 线索：flash_attn 是本仓库自己的封装（nanochat/flash_attention.py），
         #       它的基础实现（SDPA）也是你要写的 —— 两个任务在这里汇合。
-        raise NotImplementedError("核心任务 1：实现 CausalSelfAttention.forward")
+        batch, seq_len, _ = x.shape
+        q = self.c_q(x).view(batch, seq_len, self.n_head, self.head_dim)
+        k = self.c_k(x).view(batch, seq_len, self.n_kv_head, self.head_dim)
+        v = self.c_v(x).view(batch, seq_len, self.n_kv_head, self.head_dim)
+
+        if ve is not None:
+            ve = ve.view(batch, seq_len, self.n_kv_head, self.head_dim)
+            gate = 3 * torch.sigmoid(
+                self.ve_gate(x[..., :self.ve_gate_channels])
+            )
+            v = v + gate.unsqueeze(-1) * ve
+
+        q = apply_rotary_emb(q, *cos_sin)
+        k = apply_rotary_emb(k, *cos_sin)
+        q = norm(q) * 1.2
+        k = norm(k) * 1.2
+
+        if kv_cache is None:
+            y = flash_attn.flash_attn_func(
+                q, k, v, causal=True, window_size=window_size
+            )
+        else:
+            k_cache, v_cache = kv_cache.get_layer_cache(self.layer_idx)
+            y = flash_attn.flash_attn_with_kvcache(
+                q, k_cache, v_cache, k=k, v=v,
+                cache_seqlens=kv_cache.cache_seqlens,
+                causal=True, window_size=window_size,
+            )
+            if self.layer_idx == kv_cache.n_layers - 1:
+                kv_cache.advance(seq_len)
+
+        y = y.contiguous().view(batch, seq_len, -1)
+        return self.c_proj(y)
 class MLP(nn.Module):
     def __init__(self, config):
         super().__init__()
@@ -219,7 +258,9 @@ class MLP(nn.Module):
         #
         # 为什么用 ReLU²？见 docs/03_思考题.md 第 3 题。
         # 提示：它比 GELU 少一次指数运算，且在 bf16 下数值行为更简单。
-        raise NotImplementedError("基础任务 5：实现 MLP 前向")
+        x = self.c_fc(x)
+        x = F.relu(x).square()
+        return self.c_proj(x)
 class Block(nn.Module):
     def __init__(self, config, layer_idx):
         super().__init__()
@@ -234,7 +275,8 @@ class Block(nn.Module):
         #
         # 注意参数要按顺序往下传全（ve / cos_sin / window_size / kv_cache 一个都不能丢）。
         # 提示：norm 是你写的（基础任务 1），attn 与 mlp 也在本文件里。
-        raise NotImplementedError("基础任务 6：实现 Block 前向")
+        x = x + self.attn(norm(x), ve, cos_sin, window_size, kv_cache)
+        return x + self.mlp(norm(x))
 class GPT(nn.Module):
     def __init__(self, config, pad_vocab_size_to=64):
         """
@@ -364,7 +406,13 @@ class GPT(nn.Module):
         #     位置范围越远 —— 调它是个可以做的实验（docs/03_思考题.md 第 2 题）
         #   * device 参数别忘，否则表建在 CPU 上、前向时设备不匹配
         #   * 频率建议用 float32 算，最后再转 COMPUTE_DTYPE（数值更稳）
-        raise NotImplementedError("基础任务 3：实现 RoPE 频率表")
+        device = torch.device("cpu") if device is None else device
+        inv_freq = 1.0 / (base ** (torch.arange(0, head_dim, 2, device=device, dtype=torch.float32) / head_dim))
+        positions = torch.arange(seq_len, device=device, dtype=torch.float32)
+        angles = torch.outer(positions, inv_freq)
+        cos = angles.cos().view(1, seq_len, 1, head_dim // 2)
+        sin = angles.sin().view(1, seq_len, 1, head_dim // 2)
+        return cos.to(dtype=COMPUTE_DTYPE), sin.to(dtype=COMPUTE_DTYPE)
     def _compute_window_sizes(self, config):
         """
         Compute per-layer window sizes for sliding window attention.
@@ -623,7 +671,75 @@ class GPT(nn.Module):
         #
         # 自检会同时检查：logits 形状、|logits| <= 15、loss 有限、
         # "mean" 与 "none".mean() 一致、以及增量解码与全序列前向一致。
-        raise NotImplementedError("核心任务 8：实现 GPT.forward")
+        batch, seq_len = idx.shape
+        start_pos = 0 if kv_cache is None else kv_cache.get_pos()
+        end_pos = start_pos + seq_len
+        assert end_pos <= self.rotary_seq_len, (
+            f"sequence end {end_pos} exceeds rotary table length {self.rotary_seq_len}"
+        )
+        assert self.cos.device == idx.device and self.sin.device == idx.device, (
+            "RoPE tables and token indices must be on the same device"
+        )
+        assert self.cos.dtype == COMPUTE_DTYPE and self.sin.dtype == COMPUTE_DTYPE, (
+            f"RoPE table dtype must match COMPUTE_DTYPE ({COMPUTE_DTYPE})"
+        )
+        cos_sin = (
+            self.cos[:, start_pos:end_pos],
+            self.sin[:, start_pos:end_pos],
+        )
+
+        x = self.transformer.wte(idx).to(dtype=COMPUTE_DTYPE)
+        x = norm(x)
+
+        if kv_cache is None:
+            gate = self.smear_lambda.to(x.dtype) * torch.sigmoid(
+                self.smear_gate(x[:, 1:, :24])
+            )
+            x = torch.cat([x[:, :1], x[:, 1:] + gate * x[:, :-1]], dim=1)
+        else:
+            x_pre_smear = kv_cache.prev_embedding
+            kv_cache.prev_embedding = x[:, -1:, :]
+            if seq_len > 1:
+                gate = self.smear_lambda.to(x.dtype) * torch.sigmoid(
+                    self.smear_gate(x[:, 1:, :24])
+                )
+                x = torch.cat([x[:, :1], x[:, 1:] + gate * x[:, :-1]], dim=1)
+            elif x_pre_smear is not None:
+                gate = self.smear_lambda.to(x.dtype) * torch.sigmoid(
+                    self.smear_gate(x[:, :, :24])
+                )
+                x = x + gate * x_pre_smear
+
+        x0 = x
+        x_backout = None
+        backout_layer = self.config.n_layer // 2
+        for i, block in enumerate(self.transformer.h):
+            x = (
+                self.resid_lambdas[i].to(x.dtype) * x
+                + self.x0_lambdas[i].to(x.dtype) * x0
+            )
+            ve = (
+                self.value_embeds[str(i)](idx).to(dtype=x.dtype)
+                if str(i) in self.value_embeds else None
+            )
+            x = block(x, ve, cos_sin, self.window_sizes[i], kv_cache)
+            if i == backout_layer:
+                x_backout = x
+
+        if x_backout is not None:
+            x = x - self.backout_lambda.to(x.dtype) * x_backout
+        x = norm(x)
+        logits = self.lm_head(x)[..., :self.config.vocab_size].float()
+        logits = 15 * torch.tanh(logits / 15)
+
+        if targets is None:
+            return logits
+        return F.cross_entropy(
+            logits.reshape(-1, logits.size(-1)),
+            targets.reshape(-1),
+            ignore_index=-1,
+            reduction=loss_reduction,
+        )
     @torch.inference_mode()
     def generate(self, tokens, max_tokens, temperature=1.0, top_k=None, seed=42):
         """

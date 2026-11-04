@@ -138,7 +138,35 @@ class KVCache:
         #   * torch.repeat_interleave 或 .repeat 都行，注意维度顺序
         #   * 复制的是**已经算好的** KV，所以这一步不做任何矩阵运算（很便宜）
         #   * 复制后各样本共享同一段 prompt 的 cache，但后续写入互不影响
-        raise NotImplementedError("核心任务 6：KVCache.prefill")
+        assert self.cache_seqlens.eq(0).all().item(), "prefill target cache must be empty"
+        assert self.n_layers == other.n_layers
+        assert self.max_seq_len == other.max_seq_len
+        assert self.n_heads == other.n_heads
+        assert self.head_dim == other.head_dim
+        assert self.k_cache.device == other.k_cache.device
+        assert self.k_cache.dtype == other.k_cache.dtype
+        assert self.batch_size % other.batch_size == 0, (
+            "target cache batch size must be a multiple of source batch size"
+        )
+
+        repeats = self.batch_size // other.batch_size
+        positions = other.cache_seqlens
+        assert positions.eq(positions[:1]).all().item(), (
+            "source cache rows must have the same sequence length"
+        )
+        pos = int(positions[0].item())
+        assert pos <= self.max_seq_len
+        self.k_cache[:, :, :pos].copy_(
+            other.k_cache[:, :, :pos].repeat_interleave(repeats, dim=1)
+        )
+        self.v_cache[:, :, :pos].copy_(
+            other.v_cache[:, :, :pos].repeat_interleave(repeats, dim=1)
+        )
+        self.cache_seqlens.copy_(positions.repeat_interleave(repeats))
+        if other.prev_embedding is not None:
+            self.prev_embedding = other.prev_embedding.repeat_interleave(
+                repeats, dim=0
+            ).clone()
 # -----------------------------------------------------------------------------
 @torch.inference_mode()
 def sample_next_token(logits, rng, temperature=1.0, top_k=None):
@@ -160,7 +188,19 @@ def sample_next_token(logits, rng, temperature=1.0, top_k=None):
     #     温度很低（<0.3）时容易复读。扫温度画"复读率 vs 跑偏率"曲线
     #     是 docs/03_思考题.md 第 6 题
     #   * top_k 的有效范围要 clamp 到 V，别让 topk 报错
-    raise NotImplementedError("基础任务 4：采样式生成")
+    if temperature < 0:
+        raise ValueError("temperature must be non-negative")
+    if temperature == 0:
+        return logits.argmax(dim=-1, keepdim=True)
+
+    scaled_logits = logits / temperature
+    if top_k is not None and top_k > 0:
+        k = min(int(top_k), scaled_logits.size(-1))
+        threshold = scaled_logits.topk(k, dim=-1).values[..., -1, None]
+        scaled_logits = scaled_logits.masked_fill(scaled_logits < threshold, float("-inf"))
+
+    probs = F.softmax(scaled_logits, dim=-1)
+    return torch.multinomial(probs, num_samples=1, generator=rng)
 # -----------------------------------------------------------------------------
 
 class RowState:
@@ -200,7 +240,75 @@ class Engine:
         # 建议的推进顺序（这段代码比较长，别想一次写对）：
         #   先跑通 batch=1、num_samples=1、不带滑窗；再加批量；最后加窗口。
         #   参考 GPT.generate —— 那是更慢但更直白的实现，先写它更容易建立信心。
-        raise NotImplementedError("核心任务 5：Engine.generate")
+        if num_samples < 1:
+            raise ValueError("num_samples must be at least 1")
+        if temperature < 0:
+            raise ValueError("temperature must be non-negative")
+
+        device = next(self.model.parameters()).device
+        prompt = torch.as_tensor(tokens, dtype=torch.long, device=device)
+        if prompt.ndim != 1 or prompt.numel() == 0:
+            raise ValueError("tokens must be a non-empty one-dimensional prompt")
+
+        config = self.model.config
+        if max_tokens is None:
+            max_tokens = max(0, config.sequence_len - prompt.numel())
+        if max_tokens < 0:
+            raise ValueError("max_tokens must be non-negative")
+        if prompt.numel() > config.sequence_len:
+            raise ValueError("prompt exceeds model sequence_len")
+        max_tokens = min(max_tokens, config.sequence_len - prompt.numel())
+        if max_tokens == 0:
+            return
+
+        cache = KVCache(
+            1, config.n_kv_head, config.sequence_len,
+            config.n_embd // config.n_head, config.n_layer,
+            device, COMPUTE_DTYPE,
+        )
+        logits = self.model(prompt.unsqueeze(0), kv_cache=cache)[:, -1, :]
+
+        if num_samples > 1:
+            batch_cache = KVCache(
+                num_samples, config.n_kv_head, config.sequence_len,
+                config.n_embd // config.n_head, config.n_layer,
+                device, COMPUTE_DTYPE,
+            )
+            batch_cache.prefill(cache)
+            cache = batch_cache
+            logits = logits.expand(num_samples, -1)
+
+        rng = torch.Generator(device=device)
+        rng.manual_seed(seed)
+        assistant_end = self.tokenizer.encode_special("<|assistant_end|>")
+        bos = self.tokenizer.get_bos_token_id()
+        states = [RowState(tokens) for _ in range(num_samples)]
+
+        for step in range(max_tokens):
+            sampled = sample_next_token(
+                logits, rng, temperature=temperature, top_k=top_k
+            ).reshape(-1)
+            token_column = sampled.tolist()
+            token_masks = [1] * num_samples
+
+            for row, state in enumerate(states):
+                if state.completed:
+                    token_column[row] = bos
+                    token_masks[row] = 0
+                    continue
+                state.current_tokens.append(token_column[row])
+                if token_column[row] in (assistant_end, bos):
+                    state.completed = True
+
+            yield token_column, token_masks
+
+            if step + 1 == max_tokens or all(state.completed for state in states):
+                break
+
+            next_tokens = torch.tensor(
+                token_column, dtype=torch.long, device=device
+            ).unsqueeze(1)
+            logits = self.model(next_tokens, kv_cache=cache)[:, -1, :]
     def generate_batch(self, tokens, num_samples=1, **kwargs):
         """
         Non-streaming batch generation that just returns the final token sequences.
