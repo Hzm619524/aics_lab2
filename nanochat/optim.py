@@ -38,6 +38,15 @@ def adamw_step_fused(
     All in one compiled graph to eliminate Python overhead between ops.
     The 0-D CPU tensors avoid recompilation when hyperparameter values change.
     """
+    if p.device.type == "npu":
+        # torch_npu lerp_ expects a scalar weight, not a CPU tensor.
+        step_t = step_t.item()
+        lr_t = lr_t.item()
+        beta1_t = beta1_t.item()
+        beta2_t = beta2_t.item()
+        eps_t = eps_t.item()
+        wd_t = wd_t.item()
+
     # Some params (wte, value_embeds) are stored in bf16, so do the math in fp32 and
     # cast back at the end. MPS errors on mixed-dtype ops (CUDA promotes them), and
     # scalar arithmetic like 1 - beta2 loses all precision in bf16. compile fuses the casts.
@@ -126,9 +135,15 @@ def muon_step_fused(
     All in one compiled graph to eliminate Python overhead between ops.
     Some of the constants are 0-D CPU tensors to avoid recompilation when values change.
     """
+    is_npu = stacked_grads.device.type == "npu"
+    if is_npu:
+        momentum_t = momentum_t.item()
+        lr_t = lr_t.item()
+        wd_t = wd_t.item()
+        beta2_t = beta2_t.item()
 
     # Nesterov momentum
-    momentum = momentum_t.to(stacked_grads.dtype)
+    momentum = momentum_t if is_npu else momentum_t.to(stacked_grads.dtype)
     momentum_buffer.lerp_(stacked_grads, 1 - momentum)
     g = stacked_grads.lerp_(momentum_buffer, momentum)
 
@@ -161,7 +176,7 @@ def muon_step_fused(
     g = g * (target_norm / current_norm).to(g.dtype)
 
     # Variance reduction
-    beta2 = beta2_t.to(g.dtype)
+    beta2 = beta2_t if is_npu else beta2_t.to(g.dtype)
     v_mean = g.float().square().mean(dim=red_dim, keepdim=True)
     red_dim_size = g.size(red_dim)
     v_norm_sq = v_mean.sum(dim=(-2, -1), keepdim=True) * red_dim_size
@@ -174,8 +189,8 @@ def muon_step_fused(
     g = g * final_scale.to(g.dtype)
 
     # Cautious weight decay + parameter update
-    lr = lr_t.to(g.dtype)
-    wd = wd_t.to(g.dtype)
+    lr = lr_t if is_npu else lr_t.to(g.dtype)
+    wd = wd_t if is_npu else wd_t.to(g.dtype)
     mask = (g * stacked_params) >= 0
     stacked_params.sub_(lr * g + lr * wd * stacked_params * mask)
 
@@ -368,6 +383,8 @@ class MuonAdamW(torch.optim.Optimizer):
         grad_chunk = info['grad_chunk']
         p = params[0]
         shape, device, dtype = p.shape, p.device, p.dtype
+        if grad_chunk.device != device or grad_chunk.dtype != dtype:
+            grad_chunk = grad_chunk.to(device=device, dtype=dtype)
 
         # How many params does this rank own?
         start_idx = rank * chunk_size
