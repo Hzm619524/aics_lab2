@@ -162,13 +162,28 @@ def check_rope():
 
     # 逐项核对频率定义
     inv = 1.0 / (base ** (torch.arange(0, head_dim, 2).float() / head_dim))
-    want_cos = torch.cos(torch.outer(torch.arange(seq_len).float(), inv))
-    d = (cos.reshape(seq_len, -1).float() - want_cos).abs().max().item()
+    angles = torch.outer(torch.arange(seq_len).float(), inv)
+    want_cos = torch.cos(angles)
+    want_sin = torch.sin(angles)
+    # RoPE tables use COMPUTE_DTYPE, so compare against the reference rounded
+    # to that dtype rather than treating expected bf16 quantization as an error.
+    want_cos_out = want_cos.to(cos.dtype).reshape(seq_len, -1).float()
+    want_sin_out = want_sin.to(sin.dtype).reshape(seq_len, -1).float()
+    d = max(
+        (cos.reshape(seq_len, -1).float() - want_cos_out).abs().max().item(),
+        (sin.reshape(seq_len, -1).float() - want_sin_out).abs().max().item(),
+    )
     assert d < 1e-5, f"频率表与定义不符，最大误差 {d:.3e}（角度是 t * inv_freq？）"
 
-    # 旋转必须保范数
+    # Exercise the actual output table, then test rotation identities in fp32
+    # so their strict tolerances measure the math rather than table quantization.
     x = torch.randn(2, seq_len, 4, head_dim)
-    y = apply_rotary_emb(x, cos, sin)
+    actual_y = apply_rotary_emb(x, cos, sin)
+    assert actual_y.shape == x.shape, f"输出形状应与输入相同，实际 {tuple(actual_y.shape)}"
+
+    reference_cos = want_cos.view(1, seq_len, 1, head_dim // 2)
+    reference_sin = want_sin.view(1, seq_len, 1, head_dim // 2)
+    y = apply_rotary_emb(x, reference_cos, reference_sin)
     assert y.shape == x.shape, f"输出形状应与输入相同，实际 {tuple(y.shape)}"
     dn = (y.float().norm(dim=-1) - x.float().norm(dim=-1)).abs().max().item()
     assert dn < 1e-4, f"旋转应保范数，范数最大变化 {dn:.3e}"
@@ -176,14 +191,18 @@ def check_rope():
     # 相对位置性质：位置平移后，q·k 只与**相对距离**有关
     q = torch.randn(1, seq_len, 1, head_dim)
     k = torch.randn(1, seq_len, 1, head_dim)
-    qr = apply_rotary_emb(q, cos, sin)[0, 3]     # 位置 3 的 q
-    kr = apply_rotary_emb(k, cos, sin)[0, 7]      # 位置 7 的 k
+    qr = apply_rotary_emb(q, reference_cos, reference_sin)[0, 3]     # 位置 3 的 q
+    kr = apply_rotary_emb(k, reference_cos, reference_sin)[0, 7]      # 位置 7 的 k
     # 把两者整体平移同样的量，内积应当不变
     # 把位置 3 与 7 的内容整体右移 shift 位（roll 会把末端绕回开头，
     # 但 3 和 7 都远小于 seq_len，不会被绕过）
     shift = 4
-    q_s = apply_rotary_emb(torch.roll(q, shift, dims=1), cos, sin)[0, 3 + shift]
-    k_s = apply_rotary_emb(torch.roll(k, shift, dims=1), cos, sin)[0, 7 + shift]
+    q_s = apply_rotary_emb(
+        torch.roll(q, shift, dims=1), reference_cos, reference_sin
+    )[0, 3 + shift]
+    k_s = apply_rotary_emb(
+        torch.roll(k, shift, dims=1), reference_cos, reference_sin
+    )[0, 7 + shift]
     d_inv = abs((qr * kr).sum().item() - (q_s * k_s).sum().item())
     assert d_inv < 1e-3, (
         f"RoPE 的平移不变性不成立（差 {d_inv:.3e}）—— 内积应只依赖相对距离\n"
@@ -307,6 +326,17 @@ def check_forward():
     from nanochat.gpt import GPT
     torch.manual_seed(0)
     cfg = _tiny_config()
+    if hasattr(torch, "npu") and torch.npu.is_available():
+        with torch.device("meta"):
+            npu_model = GPT(cfg)
+        npu_device = torch.device("npu", torch.npu.current_device())
+        npu_model.to_empty(device=npu_device)
+        npu_model.init_weights()
+        assert npu_model.cos.device == npu_device and npu_model.sin.device == npu_device, (
+            "RoPE tables must stay on the target device after init_weights()"
+        )
+        del npu_model
+
     model = GPT(cfg)
     idx = torch.randint(0, cfg.vocab_size, (2, 32))
     logits = model(idx)
