@@ -116,7 +116,7 @@ def _sdpa_attention(q, k, v, window_size, enable_gqa):
     tq, tk = q.size(-2), k.size(-2)
     left = window_size[0]
 
-    if left < 0 and tq == tk:
+    if tq == tk and (left < 0 or left >= tk - 1):
         return F.scaled_dot_product_attention(
             q, k, v, is_causal=True, enable_gqa=enable_gqa
         )
@@ -211,11 +211,12 @@ def attn_impl() -> str:
     return env
 
 
-def npu_fa_config() -> dict:
+def npu_fa_config(windowed: bool = False) -> dict:
     """从环境变量读融合注意力的参数（默认值按 SDPA 的语义推）。"""
     return {
-        # 2 = top-left causal，与 SDPA 的 is_causal=True 语义一致
-        "sparse_mode": int(os.environ.get("NANOCHAT_NPU_FA_SPARSE_MODE", "2")),
+        # Sliding windows require band mode; full causal attention uses mode 2.
+        "sparse_mode": int(os.environ.get(
+            "NANOCHAT_NPU_FA_SPARSE_MODE", "4" if windowed else "2")),
         # pre_tockens 为 None 时按 window+1 推（SDPA 的 mask 是 i-j <= window，
         # 即含自己在内共 window+1 个 key）；实测语义不同的话用环境变量覆盖
         "pre_tokens": os.environ.get("NANOCHAT_NPU_FA_PRE_TOKENS"),
@@ -269,7 +270,24 @@ def _npu_causal_mask(seq_len: int, device):
     #       所以即使只想要滑窗也必须传 mask。
     #
     # 提示：结果按 (device, NPU_FA_MASK_SIZE) 缓存，别每层都重建。
-    raise NotImplementedError("进阶挑战 1a：构造融合注意力的 mask")
+    if seq_len <= 0:
+        raise ValueError("seq_len must be positive")
+    if seq_len > NPU_FA_MASK_SIZE:
+        raise ValueError(
+            f"seq_len={seq_len} exceeds NPU_FA_MASK_SIZE={NPU_FA_MASK_SIZE}; "
+            "set NANOCHAT_NPU_FA_MASK_SIZE to a supported larger size")
+
+    device = torch.device(device)
+    key = (device.type, device.index, NPU_FA_MASK_SIZE)
+    mask = _NPU_MASK_CACHE.get(key)
+    if mask is None:
+        mask = torch.triu(
+            torch.ones((NPU_FA_MASK_SIZE, NPU_FA_MASK_SIZE),
+                       dtype=torch.bool, device=device),
+            diagonal=1,
+        ).contiguous()
+        _NPU_MASK_CACHE[key] = mask
+    return mask
 def _should_use_npu_fa(window_size, seq_len: int) -> bool:
     """
     这一层该不该用融合算子。
@@ -316,7 +334,51 @@ def _npu_attention(q, k, v, window_size):
     #   3) 实测并报告加速比（scripts/bench_attention.py）。
     #
     # 配置从 npu_fa_config() 读（环境变量优先），便于不改代码就换参数。
-    raise NotImplementedError("进阶挑战 1b：接入 npu_fusion_attention")
+    if _npu_fa is None:
+        raise RuntimeError("torch_npu.npu_fusion_attention is unavailable")
+    if q.ndim != 4 or k.ndim != 4 or v.ndim != 4:
+        raise ValueError("q, k, and v must have shape (B, T, H, D)")
+    if q.shape[:2] != k.shape[:2] or k.shape != v.shape:
+        raise ValueError("q/k/v batch and sequence dimensions must match")
+    if q.shape[-1] != k.shape[-1]:
+        raise ValueError("q/k/v head dimensions must match")
+    if q.device != k.device or k.device != v.device:
+        raise ValueError("q, k, and v must be on the same device")
+    if q.dtype != k.dtype or k.dtype != v.dtype:
+        raise ValueError("q, k, and v must have the same dtype")
+
+    _, seq_len, head_num, head_dim = q.shape
+    left, right = window_size
+    if right not in (0, -1):
+        raise ValueError("npu_fusion_attention path only supports causal windows")
+    windowed = 0 <= left < seq_len
+    config = npu_fa_config(windowed=windowed)
+    pre_tokens = config["pre_tokens"]
+    if pre_tokens is None:
+        pre_tokens = (left + config["window_offset"] - 1
+                      if windowed else seq_len)
+    else:
+        pre_tokens = int(pre_tokens)
+    if pre_tokens < 0:
+        raise ValueError("NANOCHAT_NPU_FA_PRE_TOKENS must be non-negative")
+
+    result = _npu_fa(
+        q,
+        k,
+        v,
+        head_num=head_num,
+        input_layout="BSND",
+        atten_mask=_npu_causal_mask(seq_len, q.device),
+        scale=1.0 / math.sqrt(head_dim),
+        keep_prob=1.0,
+        pre_tockens=pre_tokens,
+        next_tockens=config["next_tokens"],
+        sparse_mode=config["sparse_mode"],
+    )
+    output = result[0] if isinstance(result, (tuple, list)) else result
+    if not isinstance(output, torch.Tensor) or output.shape != q.shape:
+        raise RuntimeError("npu_fusion_attention returned an unexpected output")
+    return output
 # =============================================================================
 # Public API: Same interface as FA3
 # =============================================================================
@@ -440,8 +502,8 @@ def flash_attn_with_kvcache(q, k_cache, v_cache, k=None, v=None, cache_seqlens=N
         k_cache[:, pos:end_pos].copy_(k)
         v_cache[:, pos:end_pos].copy_(v)
 
-    k_all = k_cache[:, :end_pos]
-    v_all = v_cache[:, :end_pos]
+    k_all = k_cache[:, :end_pos].to(dtype=q.dtype)
+    v_all = v_cache[:, :end_pos].to(dtype=q.dtype)
     y = _sdpa_attention(
         q.transpose(1, 2), k_all.transpose(1, 2), v_all.transpose(1, 2),
         window_size, enable_gqa=q.size(2) != k_all.size(2),

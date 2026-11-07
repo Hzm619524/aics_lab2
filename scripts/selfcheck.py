@@ -93,6 +93,58 @@ def check_norm():
     assert norm(x).dtype == torch.bfloat16, "bf16 输入应当返回 bf16"
 
 
+@check("rmsnorm_impl", "进阶 1：RMSNorm 融合实现开关与原生实现隔离")
+def check_rmsnorm_impl():
+    import types
+    from nanochat import gpt
+
+    sentinel = object()
+    previous_module = sys.modules.get("torch_npu", sentinel)
+    previous_env = os.environ.get("NANOCHAT_RMSNORM_IMPL")
+    previous_state = gpt._NPU_RMS_STATE.copy()
+    previous_cache = gpt._NPU_RMS_WEIGHT_CACHE.copy()
+    calls = []
+
+    def fake_rms_norm(x, weight, epsilon):
+        calls.append((tuple(x.shape), x.device.type, epsilon, weight))
+        return (F.rms_norm(x, (x.shape[-1],), weight=weight, eps=epsilon),)
+
+    fake_module = types.ModuleType("torch_npu")
+    fake_module.npu_rms_norm = fake_rms_norm
+    try:
+        sys.modules["torch_npu"] = fake_module
+        os.environ["NANOCHAT_RMSNORM_IMPL"] = "npu"
+        gpt._NPU_RMS_STATE.update(resolved=False, mode=None, fn=None)
+        gpt._NPU_RMS_WEIGHT_CACHE.clear()
+        x = torch.randn(2, 3, 32)
+        got = gpt.norm(x)
+        want = F.rms_norm(x, (32,), eps=1e-6)
+        assert (got - want).abs().max().item() < 1e-6
+        assert len(calls) == 1 and calls[0][:3] == ((2, 3, 32), "cpu", 1e-6), (
+            f"NPU RMSNorm 开关未调用预期融合函数：{calls}")
+        os.environ["NANOCHAT_RMSNORM_IMPL"] = "native"
+        native = gpt.norm(x)
+        assert len(calls) == 1, "native 模式不能调用融合函数"
+        assert (native - want).abs().max().item() < 1e-6
+        os.environ["NANOCHAT_RMSNORM_IMPL"] = "npu"
+        gpt.norm(x)
+        assert len(calls) == 2 and calls[0][3] is calls[1][3], (
+            "切回 npu 模式后应复用该设备/shape 的权重缓存")
+    finally:
+        gpt._NPU_RMS_STATE.clear()
+        gpt._NPU_RMS_STATE.update(previous_state)
+        gpt._NPU_RMS_WEIGHT_CACHE.clear()
+        gpt._NPU_RMS_WEIGHT_CACHE.update(previous_cache)
+        if previous_env is None:
+            os.environ.pop("NANOCHAT_RMSNORM_IMPL", None)
+        else:
+            os.environ["NANOCHAT_RMSNORM_IMPL"] = previous_env
+        if previous_module is sentinel:
+            sys.modules.pop("torch_npu", None)
+        else:
+            sys.modules["torch_npu"] = previous_module
+
+
 @check("rope", "基础任务 2/3：RoPE 频率表与旋转")
 def check_rope():
     from nanochat.gpt import GPT
@@ -338,6 +390,109 @@ def check_sampling():
         for i in range(len(s)):
             assert s[i].item() in allowed[i].tolist(), (
                 f"采到了 top-{k} 之外的 token —— top_k 截断没生效？")
+
+
+@check("generate", "进阶 A：朴素生成可复现、限长且与 Engine 一致")
+def check_generate():
+    from nanochat.engine import Engine
+    from nanochat.gpt import GPT
+
+    torch.manual_seed(0)
+    cfg = _tiny_config()
+    cfg.sequence_len = 16
+    model = GPT(cfg).eval()
+    prompt = [1, 2, 3]
+
+    first = list(model.generate(prompt, 5, temperature=0.8, top_k=8, seed=123))
+    second = list(model.generate(prompt, 5, temperature=0.8, top_k=8, seed=123))
+    assert first == second, "相同 seed 的 GPT.generate 结果必须一致"
+    assert len(first) == 5 and all(0 <= token < cfg.vocab_size for token in first)
+
+    capped = list(model.generate(prompt, 100, temperature=0.0))
+    assert len(capped) == cfg.sequence_len - len(prompt), (
+        "生成长度必须被 sequence_len - prompt_len 截断")
+
+    class _Tokenizer:
+        def encode_special(self, _name):
+            return -1
+
+        def get_bos_token_id(self):
+            return -2
+
+    reference = list(model.generate(prompt, 5, temperature=0.0, seed=7))
+    engine_tokens = []
+    engine = Engine(model, _Tokenizer())
+    for token_column, _token_masks in engine.generate(
+            prompt, num_samples=1, max_tokens=5, temperature=0.0, seed=7):
+        engine_tokens.append(token_column[0])
+    assert engine_tokens == reference, (
+        f"Engine 与朴素生成不一致：{engine_tokens} != {reference}")
+
+
+@check("scaling_data", "进阶 2：Scaling 统计训练 Parquet 文本且排除验证 shard")
+def check_scaling_data():
+    import tempfile
+    from pathlib import Path
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+    from scripts.bench_scaling import _corpus_bytes
+
+    with tempfile.TemporaryDirectory() as temp_dir:
+        data_dir = Path(temp_dir)
+        pq.write_table(pa.table({"text": ["A", "水"]}),
+                       data_dir / "shard_00001.parquet")
+        pq.write_table(pa.table({"text": ["validation text"]}),
+                       data_dir / "shard_99999.parquet")
+        assert _corpus_bytes(data_dir, require_train_data=True) == 4, (
+            "训练集 byte 计数应统计 UTF-8 text 列，并忽略最后的验证 shard")
+
+
+@check("text_dataloader", "README 数据格式：纯文本目录按末文件划分验证集")
+def check_text_dataloader():
+    import tempfile
+    from pathlib import Path
+    from nanochat import dataloader
+    from scripts.bench_scaling import _corpus_bytes
+
+    previous_data_dir = os.environ.get("NANOCHAT_DATA_DIR")
+    try:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            data_dir = Path(temp_dir)
+            train_text = "first training paragraph\n\nsecond training paragraph\n"
+            train_jsonl = '{"text":"third training document"}\n'
+            val_text = "validation paragraph one\n\nvalidation paragraph two\n"
+            (data_dir / "01_train.txt").write_text(train_text, encoding="utf-8")
+            (data_dir / "02_train.jsonl").write_text(train_jsonl, encoding="utf-8")
+            (data_dir / "99_validation.txt").write_text(val_text, encoding="utf-8")
+            os.environ["NANOCHAT_DATA_DIR"] = str(data_dir)
+
+            train_batches = dataloader._document_batches("train", None, 1)
+            try:
+                training_docs = [next(train_batches)[0][0] for _ in range(3)]
+            finally:
+                train_batches.close()
+            assert set(training_docs) == {
+                "first training paragraph", "second training paragraph",
+                "third training document",
+            }
+
+            validation_batches = dataloader._document_batches("val", None, 1)
+            try:
+                validation_docs = [next(validation_batches)[0][0]
+                                   for _ in range(2)]
+            finally:
+                validation_batches.close()
+            assert validation_docs == [
+                "validation paragraph one", "validation paragraph two",
+            ]
+            expected_bytes = ((data_dir / "01_train.txt").stat().st_size
+                              + len("third training document".encode("utf-8")))
+            assert _corpus_bytes(data_dir, require_train_data=True) == expected_bytes
+    finally:
+        if previous_data_dir is None:
+            os.environ.pop("NANOCHAT_DATA_DIR", None)
+        else:
+            os.environ["NANOCHAT_DATA_DIR"] = previous_data_dir
 
 
 @check("kvcache", "核心任务 5/6：KV cache 增量解码 == 全序列前向（最强的一致性检查）")

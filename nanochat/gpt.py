@@ -57,15 +57,15 @@ class GPTConfig:
 # 默认 "native"（保持原行为）。改 NANOCHAT_RMSNORM_IMPL=npu 才走融合算子。
 # 是否可用先用 scripts/check_npu_attention.py --bench 验证。
 _RMS_EPS = 1e-6
-_NPU_RMS_STATE: dict = {"resolved": False, "fn": None}
+_NPU_RMS_STATE: dict = {"resolved": False, "mode": None, "fn": None}
 _NPU_RMS_WEIGHT_CACHE: dict = {}
 
 
 def _resolve_npu_rms_norm():
     """惰性解析（不在 import 时决定）：gpt.py 被导入时环境变量未必就绪。"""
-    if _NPU_RMS_STATE["resolved"]:
-        return _NPU_RMS_STATE["fn"]
     mode = os.environ.get("NANOCHAT_RMSNORM_IMPL", "native").strip().lower()
+    if _NPU_RMS_STATE["resolved"] and _NPU_RMS_STATE["mode"] == mode:
+        return _NPU_RMS_STATE["fn"]
     fn = None
     if mode == "npu":
         try:
@@ -81,7 +81,7 @@ def _resolve_npu_rms_norm():
     elif mode != "native":
         raise ValueError(
             f"NANOCHAT_RMSNORM_IMPL 只能是 native / npu，收到 {mode!r}")
-    _NPU_RMS_STATE.update(resolved=True, fn=fn)
+    _NPU_RMS_STATE.update(resolved=True, mode=mode, fn=fn)
     return fn
 
 
@@ -98,6 +98,16 @@ def norm(x):
     #   * 输入可能是 bf16；先转 float32 算再转回去更稳
     #
     # 一行就能写完，但请自己实现 —— 进阶挑战 1 要拿它和融合算子对比性能。
+    fused_norm = _resolve_npu_rms_norm()
+    if fused_norm is not None:
+        channels = x.shape[-1]
+        key = (x.device.type, x.device.index, channels, x.dtype)
+        weight = _NPU_RMS_WEIGHT_CACHE.get(key)
+        if weight is None:
+            weight = torch.ones(channels, dtype=x.dtype, device=x.device)
+            _NPU_RMS_WEIGHT_CACHE[key] = weight
+        return fused_norm(x, weight, epsilon=_RMS_EPS)[0]
+
     x_float = x.float()
     return (x_float * torch.rsqrt(
         x_float.square().mean(dim=-1, keepdim=True) + _RMS_EPS
@@ -765,4 +775,29 @@ class GPT(nn.Module):
         #   * rng 必须由 seed 构造（torch.Generator(device=...) + manual_seed(seed)），
         #     否则同一 seed 不可复现，实验之间无法对比
         #   * 这个函数在 __init__ 里被标记为 @torch.inference_mode()，别把梯度带进来
-        raise NotImplementedError("进阶任务：实现朴素采样式生成")
+        if temperature < 0:
+            raise ValueError("temperature must be non-negative")
+        if max_tokens < 0:
+            raise ValueError("max_tokens must be non-negative")
+
+        device = self.get_device()
+        idx = torch.as_tensor(tokens, dtype=torch.long, device=device)
+        if idx.ndim != 1 or idx.numel() == 0:
+            raise ValueError("tokens must be a non-empty one-dimensional prompt")
+        if idx.numel() > self.config.sequence_len:
+            raise ValueError("prompt exceeds model sequence_len")
+        max_tokens = min(max_tokens, self.config.sequence_len - idx.numel())
+        rng = torch.Generator(device=device)
+        rng.manual_seed(seed)
+
+        from nanochat.engine import sample_next_token
+
+        idx = idx.unsqueeze(0)
+        for _ in range(max_tokens):
+            idx_cond = idx[:, -self.config.sequence_len:]
+            logits = self(idx_cond)[:, -1, :]
+            next_token = sample_next_token(
+                logits, rng, temperature=temperature, top_k=top_k
+            )
+            idx = torch.cat((idx, next_token), dim=1)
+            yield int(next_token.item())
