@@ -190,7 +190,7 @@ orig_model = model # original, uncompiled model, for saving raw model state_dict
 if args.enforce_eager:
     print0("torch.compile: 关闭（--enforce-eager）")
     model = orig_model
-elif compile_enabled(args.device_type):
+elif compile_enabled(device_type):
     model = torch.compile(model, dynamic=False) # the inputs to model will never change shape so dynamic=False is safe
 else:
     model = orig_model

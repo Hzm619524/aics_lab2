@@ -40,7 +40,7 @@ python scripts/selfcheck.py || {
 if [[ ! -f "${NANOCHAT_BASE_DIR:-$HOME/.cache/nanochat}/tokenizer/tokenizer.pkl" ]]; then
     echo
     echo "[2/3] 训练分词器"
-    python -m scripts.tok_train -- --vocab-size=16384
+    python -m scripts.tok_train --vocab-size=16384
 else
     echo
     echo "[2/3] 分词器已存在，跳过"
@@ -59,7 +59,7 @@ torchrun --standalone --nproc_per_node=1 -m scripts.base_train -- \
     --sample-every=-1 \
     --save-every=200 \
     --model-tag="$TAG" \
-    --run="$TAG"
+    --run=dummy
 
 cat <<EOF
 
